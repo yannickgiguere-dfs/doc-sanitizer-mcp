@@ -115,20 +115,51 @@ Use `get_profile` with a profile name or ID to see detailed settings.
 async def handle_sanitize_document(arguments: dict[str, Any]) -> list[TextContent]:
     """Handle sanitize_document tool call.
 
-    Accepts a file_id (from HTTP upload) and returns sanitized markdown text.
+    Accepts either:
+    - file_content (base64) + filename: When user attaches a file in Claude Desktop
+    - file_id: When file was uploaded via HTTP endpoint
     """
+    import base64
+
     file_id = arguments.get("file_id")
+    file_content = arguments.get("file_content")
+    filename = arguments.get("filename")
     profile_name = arguments.get("profile")
     profile_id = arguments.get("profile_id")
 
-    if not file_id:
-        base_url = get_http_base_url()
-        return [TextContent(type="text", text=f"""Error: file_id is required.
+    # Determine input mode
+    if file_content and filename:
+        # Mode 1: Direct file content from Claude Desktop attachment
+        try:
+            content = base64.b64decode(file_content)
+        except Exception as e:
+            return [TextContent(type="text", text=f"Error decoding file content: {str(e)}")]
+        source_filename = filename
+        cleanup_file_id = None
+        logger.info(f"Processing attached file: {filename} ({len(content)} bytes)")
 
-To sanitize a document:
-1. First upload the file: curl -F "file=@document.pdf" {base_url}/upload
-2. Use the returned file_id with this tool
-""")]
+    elif file_id:
+        # Mode 2: File ID from HTTP upload
+        file_store = get_file_store()
+        stored_file = file_store.get_file(file_id)
+
+        if not stored_file:
+            return [TextContent(type="text", text=f"Error: File not found: {file_id}. Files are deleted after 5 minutes. Please upload again.")]
+
+        content = file_store.read_file(file_id)
+        if not content:
+            return [TextContent(type="text", text=f"Error: Could not read file: {file_id}")]
+
+        source_filename = stored_file.original_filename
+        cleanup_file_id = file_id
+        logger.info(f"Processing uploaded file: {file_id} ({source_filename})")
+
+    else:
+        return [TextContent(type="text", text="""Error: Please provide either:
+- Attach a file directly (Claude will provide file_content and filename)
+- Or provide a file_id from HTTP upload
+
+Supported formats: PDF, DOCX, XLSX, CSV, TXT, EML""")]
 
     # Get profile
     try:
@@ -141,21 +172,9 @@ To sanitize a document:
     except ProfileNotFoundError as e:
         return [TextContent(type="text", text=f"Error: {str(e)}")]
 
-    # Get file from store
-    file_store = get_file_store()
-    stored_file = file_store.get_file(file_id)
-
-    if not stored_file:
-        return [TextContent(type="text", text=f"Error: File not found: {file_id}. Files are deleted after 5 minutes. Please upload again.")]
-
-    # Read file content
-    content = file_store.read_file(file_id)
-    if not content:
-        return [TextContent(type="text", text=f"Error: Could not read file: {file_id}")]
-
     # Extract document text
     try:
-        extracted = document_extractor.extract(content, stored_file.original_filename)
+        extracted = document_extractor.extract(content, source_filename)
     except ExtractionError as e:
         return [TextContent(type="text", text=f"Error extracting document: {str(e)}")]
 
@@ -165,7 +184,7 @@ To sanitize a document:
 
     try:
         client = get_ollama_client()
-        logger.info(f"Calling Ollama with model {model} for file {file_id}")
+        logger.info(f"Calling Ollama with model {model}")
         response = client.generate(
             model=model,
             prompt=prompt,
@@ -187,9 +206,11 @@ To sanitize a document:
         profile_name=profile.name,
     )
 
-    # Clean up the uploaded file (already processed)
-    file_store.delete_file(file_id)
-    logger.info(f"Processed and cleaned up file: {file_id}")
+    # Clean up uploaded file if applicable
+    if cleanup_file_id:
+        file_store = get_file_store()
+        file_store.delete_file(cleanup_file_id)
+        logger.info(f"Cleaned up file: {cleanup_file_id}")
 
     result = frontmatter + sanitized_content
     return [TextContent(type="text", text=result)]
@@ -233,20 +254,29 @@ async def main():
             ),
             Tool(
                 name="sanitize_document",
-                description=f"""Sanitize a document by removing or transforming PII according to a profile.
+                description="""Sanitize a document by removing or transforming PII according to a profile.
 
-IMPORTANT: Before calling this tool, the user must upload the file via HTTP:
-  curl -F "file=@document.pdf" {base_url}/upload
+Accepts EITHER:
+- file_content (base64) + filename: When user attaches a file directly
+- file_id: When file was uploaded via HTTP endpoint
 
-This returns a file_id to use with this tool. Files are automatically deleted after 5 minutes.
+Supported formats: PDF, DOCX, XLSX, CSV, TXT, EML
 
 Returns: Sanitized document as Markdown text with YAML frontmatter.""",
                 inputSchema={
                     "type": "object",
                     "properties": {
+                        "file_content": {
+                            "type": "string",
+                            "description": "Base64-encoded file content (use when user attaches a file)",
+                        },
+                        "filename": {
+                            "type": "string",
+                            "description": "Original filename with extension (required with file_content)",
+                        },
                         "file_id": {
                             "type": "string",
-                            "description": "UUID of the uploaded file (from HTTP upload endpoint)",
+                            "description": "UUID from HTTP upload (alternative to file_content)",
                         },
                         "profile": {
                             "type": "string",
@@ -257,7 +287,6 @@ Returns: Sanitized document as Markdown text with YAML frontmatter.""",
                             "description": "Profile ID to use (alternative to name)",
                         },
                     },
-                    "required": ["file_id"],
                 },
             ),
         ]
