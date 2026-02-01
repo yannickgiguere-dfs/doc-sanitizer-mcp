@@ -22,6 +22,7 @@ from starlette.routing import Route
 
 from .config_schema import PIIAction, PIIType
 from .extractors import DocumentExtractor, ExtractionError
+from .file_store import get_file_store, init_file_store
 from .profiles import ProfileManager, ProfileError, ProfileNotFoundError
 from .prompts import build_sanitization_prompt, build_yaml_frontmatter
 
@@ -46,6 +47,11 @@ def get_ollama_model() -> str:
     return os.environ.get("OLLAMA_MODEL", "phi4:14b")
 
 
+def get_http_base_url() -> str:
+    """Get the HTTP server base URL."""
+    return os.environ.get("HTTP_BASE_URL", "http://localhost:8080")
+
+
 def init_globals():
     """Initialize global instances."""
     global profile_manager, document_extractor, mcp_server
@@ -53,6 +59,10 @@ def init_globals():
     profile_manager = ProfileManager()
     document_extractor = DocumentExtractor()
     mcp_server = Server("doc-sanitizer")
+
+    # Initialize file store with 5-minute TTL
+    ttl_seconds = int(os.environ.get("FILE_TTL_SECONDS", 300))
+    init_file_store(ttl_seconds=ttl_seconds)
 
     # Register tools
     register_tools(mcp_server)
@@ -92,17 +102,20 @@ def register_tools(server: Server):
             ),
             Tool(
                 name="sanitize_document",
-                description="Sanitize a document by removing or transforming PII according to a profile.",
+                description=f"""Sanitize a document by removing or transforming PII according to a profile.
+
+IMPORTANT: Before calling this tool, the user must upload the file via HTTP:
+  curl -F "file=@document.pdf" {get_http_base_url()}/upload
+
+This returns a file_id to use with this tool. Files are automatically deleted after 5 minutes.
+
+Returns: Sanitized document as Markdown text with YAML frontmatter.""",
                 inputSchema={
                     "type": "object",
                     "properties": {
-                        "file_content": {
+                        "file_id": {
                             "type": "string",
-                            "description": "Base64-encoded document content",
-                        },
-                        "filename": {
-                            "type": "string",
-                            "description": "Original filename (used to determine file type)",
+                            "description": "UUID of the uploaded file (from HTTP upload endpoint)",
                         },
                         "profile": {
                             "type": "string",
@@ -113,7 +126,7 @@ def register_tools(server: Server):
                             "description": "Profile ID to use (alternative to name)",
                         },
                     },
-                    "required": ["file_content", "filename"],
+                    "required": ["file_id"],
                 },
             ),
         ]
@@ -181,14 +194,22 @@ Use `get_profile` with a profile name or ID to see detailed settings.
 
 
 async def handle_sanitize_document(arguments: dict[str, Any]) -> list[TextContent]:
-    """Handle sanitize_document tool call."""
-    file_content = arguments.get("file_content")
-    filename = arguments.get("filename")
+    """Handle sanitize_document tool call.
+
+    Accepts a file_id (from HTTP upload) and returns sanitized markdown text.
+    """
+    file_id = arguments.get("file_id")
     profile_name = arguments.get("profile")
     profile_id = arguments.get("profile_id")
 
-    if not file_content or not filename:
-        return [TextContent(type="text", text="Error: file_content and filename are required")]
+    if not file_id:
+        base_url = get_http_base_url()
+        return [TextContent(type="text", text=f"""Error: file_id is required.
+
+To sanitize a document:
+1. First upload the file: curl -F "file=@document.pdf" {base_url}/upload
+2. Use the returned file_id with this tool
+""")]
 
     # Get profile
     try:
@@ -201,9 +222,21 @@ async def handle_sanitize_document(arguments: dict[str, Any]) -> list[TextConten
     except ProfileNotFoundError as e:
         return [TextContent(type="text", text=f"Error: {str(e)}")]
 
+    # Get file from store
+    file_store = get_file_store()
+    stored_file = file_store.get_file(file_id)
+
+    if not stored_file:
+        return [TextContent(type="text", text=f"Error: File not found: {file_id}. Files are deleted after 5 minutes. Please upload again.")]
+
+    # Read file content
+    content = file_store.read_file(file_id)
+    if not content:
+        return [TextContent(type="text", text=f"Error: Could not read file: {file_id}")]
+
     # Extract document text
     try:
-        extracted = document_extractor.extract_from_base64(file_content, filename)
+        extracted = document_extractor.extract(content, stored_file.original_filename)
     except ExtractionError as e:
         return [TextContent(type="text", text=f"Error extracting document: {str(e)}")]
 
@@ -213,6 +246,7 @@ async def handle_sanitize_document(arguments: dict[str, Any]) -> list[TextConten
 
     try:
         client = get_ollama_client()
+        logger.info(f"Calling Ollama with model {model} for file {file_id}")
         response = client.generate(
             model=model,
             prompt=prompt,
@@ -234,8 +268,11 @@ async def handle_sanitize_document(arguments: dict[str, Any]) -> list[TextConten
         profile_name=profile.name,
     )
 
-    result = frontmatter + sanitized_content
+    # Clean up the uploaded file (already processed)
+    file_store.delete_file(file_id)
+    logger.info(f"Processed and cleaned up file: {file_id}")
 
+    result = frontmatter + sanitized_content
     return [TextContent(type="text", text=result)]
 
 
@@ -251,7 +288,11 @@ async def lifespan(app):
     """Application lifespan handler."""
     init_globals()
     logger.info("Doc Sanitizer MCP Server started")
+    logger.info(f"HTTP upload endpoint: {get_http_base_url()}/upload")
     yield
+    # Cleanup
+    file_store = get_file_store()
+    file_store.stop_cleanup_thread()
     logger.info("Doc Sanitizer MCP Server stopped")
 
 
