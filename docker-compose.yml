@@ -45,7 +45,7 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      - ~/.doc-sanitizer:/app/data
+      - profiles_data:/app/data
       - uploads_data:/app/uploads
     environment:
       - OLLAMA_MODEL=${OLLAMA_MODEL:-phi4:14b}
@@ -73,3 +73,5 @@ volumes:
     name: doc-sanitizer-ollama-data
   uploads_data:
     name: doc-sanitizer-uploads
+  profiles_data:
+    name: doc-sanitizer-profiles
