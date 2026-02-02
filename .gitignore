@@ -50,6 +50,20 @@ htmlcov/
 data/
 *.db
 
+# Test documents - NEVER commit real documents (PII risk)
+*.pdf
+*.docx
+*.doc
+*.xlsx
+*.xls
+*.csv
+*.eml
+*.msg
+uploads/
+test_files/
+samples/
+sample_docs/
+
 # OS
 .DS_Store
 Thumbs.db
